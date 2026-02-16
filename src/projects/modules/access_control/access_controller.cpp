@@ -180,6 +180,14 @@ std::tuple<AccessController::VerificationResult, std::shared_ptr<const Admission
 
 	if (admission_webhooks->GetErrCode() != AdmissionWebhooks::ErrCode::ALLOWED)
 	{
+		// For closing events, connection errors should not be treated as rejection
+		// The closing notification is informational, so connection failures should not block the operation
+		if (status == AdmissionWebhooks::Status::Code::CLOSING && 
+		    admission_webhooks->GetErrCode() == AdmissionWebhooks::ErrCode::INTERNAL_ERROR)
+		{
+			logtw("Failed to deliver closing webhook notification (connection error), but allowing since closing is informational");
+			return {AccessController::VerificationResult::Pass, admission_webhooks};
+		}
 		return {AccessController::VerificationResult::Fail, admission_webhooks};
 	}
 
