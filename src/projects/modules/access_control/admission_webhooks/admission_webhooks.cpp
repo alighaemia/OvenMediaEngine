@@ -337,7 +337,7 @@ void AdmissionWebhooks::Run()
 			else
 			{
 				// A connection error or an error that does not conform to the HTTP spec has occurred.
-				SetError(ErrCode::INTERNAL_ERROR, ov::String::FormatString("The HTTP client's request failed. (error code(%d) error message(%s)", error->GetCode(), error->GetMessage().CStr()));
+				SetError(ErrCode::INTERNAL_ERROR, ov::String::FormatString("The HTTP client's request failed. (error code(%d) error message(%s))", error->GetCode(), error->GetMessage().CStr()));
 				return;
 			}
 		});
