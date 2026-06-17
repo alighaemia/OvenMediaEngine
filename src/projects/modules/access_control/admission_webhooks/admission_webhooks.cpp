@@ -1,6 +1,10 @@
 #include "admission_webhooks.h"
 
 #include <modules/http/client/http_client.h>
+#include <thread>
+#include <chrono>
+
+#define OV_LOG_TAG "AdmissionWebhooks"
 
 std::shared_ptr<AdmissionWebhooks> AdmissionWebhooks::Query(ProviderType provider,
 															const std::shared_ptr<ov::Url> &control_server_url, uint32_t timeout_msec,
@@ -283,42 +287,72 @@ void AdmissionWebhooks::Run()
 
 	auto signature_sha1_base64 = ov::Base64::Encode(md_sha1, true);
 
-	auto client = std::make_shared<http::clnt::HttpClient>();
-	client->SetMethod(http::Method::Post);
-	client->SetBlockingMode(ov::BlockingMode::Blocking);
-	client->SetConnectionTimeout(_timeout_msec);
-	client->SetRecvTimeout(_timeout_msec);
-	client->SetRequestHeader("X-OME-Signature", signature_sha1_base64);
-	client->SetRequestHeader("Content-Type", "application/json");
-	client->SetRequestHeader("Accept", "application/json");
-	client->SetRequestBody(body);
+	// Retry logic for transient TCP connection failures
+	const int MAX_RETRIES = 3;
+	const int RETRY_DELAY_MS = 100;
 
 	ov::StopWatch watch;
 	watch.Start();
 
-	client->Request(_control_server_url->ToUrlString(true), [=](http::StatusCode status_code, const std::shared_ptr<ov::Data> &data, const std::shared_ptr<const ov::Error> &error) {
-		_elapsed_ms = watch.Elapsed();
-
-		// A response was received from the server.
-		if (error == nullptr)
+	for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
+	{
+		if (attempt > 0)
 		{
-			if (status_code == http::StatusCode::OK)
+			// Log retry attempt
+			logtw("Retrying AdmissionWebhook request (attempt %d/%d) to %s after connection failure", 
+				  attempt + 1, MAX_RETRIES, _control_server_url->ToUrlString(true).CStr());
+			std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
+		}
+
+		// Create a new HttpClient instance for each attempt
+		auto client = std::make_shared<http::clnt::HttpClient>();
+		client->SetMethod(http::Method::Post);
+		client->SetBlockingMode(ov::BlockingMode::Blocking);
+		client->SetConnectionTimeout(_timeout_msec);
+		client->SetRecvTimeout(_timeout_msec);
+		client->SetRequestHeader("X-OME-Signature", signature_sha1_base64);
+		client->SetRequestHeader("Content-Type", "application/json");
+		client->SetRequestHeader("Accept", "application/json");
+		client->SetRequestHeader("Connection", "close");
+		client->SetRequestBody(body);
+
+		client->Request(_control_server_url->ToUrlString(true), [=](http::StatusCode status_code, const std::shared_ptr<ov::Data> &data, const std::shared_ptr<const ov::Error> &error) {
+			_elapsed_ms = watch.Elapsed();
+
+			// A response was received from the server.
+			if (error == nullptr)
 			{
-				// Parsing response
-				ParseResponse(data);
-				return;
+				if (status_code == http::StatusCode::OK)
+				{
+					// Parsing response
+					ParseResponse(data);
+					return;
+				}
+				else
+				{
+					SetError(ErrCode::INVALID_STATUS_CODE, ov::String::FormatString("Control server responded with %d status code.", static_cast<uint16_t>(status_code)));
+					return;
+				}
 			}
 			else
 			{
-				SetError(ErrCode::INVALID_STATUS_CODE, ov::String::FormatString("Control server responded with %d status code.", static_cast<uint16_t>(status_code)));
+				// A connection error or an error that does not conform to the HTTP spec has occurred.
+				SetError(ErrCode::INTERNAL_ERROR, ov::String::FormatString("The HTTP client's request failed. (error code(%d) error message(%s))", error->GetCode(), error->GetMessage().CStr()));
 				return;
 			}
-		}
-		else
+		});
+
+		// If we got an actual HTTP response (not a connection error), don't retry
+		if (_err_code != ErrCode::INTERNAL_ERROR)
 		{
-			// A connection error or an error that does not conform to the HTTP spec has occurred.
-			SetError(ErrCode::INTERNAL_ERROR, ov::String::FormatString("The HTTP client's request failed. (error code(%d) error message(%s)", error->GetCode(), error->GetMessage().CStr()));
-			return;
+			break;
 		}
-	});
+		
+		// If this was the last attempt, we're done
+		if (attempt == MAX_RETRIES - 1)
+		{
+			logtw("AdmissionWebhook request to %s failed after %d attempts", 
+				  _control_server_url->ToUrlString(true).CStr(), MAX_RETRIES);
+		}
+	}
 }
